@@ -1,3 +1,4 @@
+from llm_suite.config import ProviderCfg
 from llm_suite.providers.dummy import DummyProvider
 from llm_suite.providers.provider_506 import Provider506
 from llm_suite.providers.azure_openai import AzureOpenAIProvider
@@ -8,9 +9,9 @@ _REGISTRY = {
     "azure_openai": AzureOpenAIProvider,
 }
 
-def make_provider(name: str):
-    name = (name or "dummy").strip()
+def make_provider(cfg: ProviderCfg):
+    name = (cfg.provider or "dummy").strip()
     cls = _REGISTRY.get(name)
     if not cls:
         raise ValueError(f"Unknown provider: {name}. Known: {sorted(_REGISTRY.keys())}")
-    return cls()
+    return cls(cfg)

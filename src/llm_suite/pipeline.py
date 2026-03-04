@@ -24,7 +24,6 @@ def run_pipeline(cfg: ResolvedConfig):
     run_dir = os.path.join(cfg.runs_dir, run_id)
     logger = RunLogger(run_dir)
 
-    # manifest
     logger.write_manifest({
         "run_id": run_id,
         "tests_path": cfg.tests_path,
@@ -32,18 +31,16 @@ def run_pipeline(cfg: ResolvedConfig):
         "enable_judge": cfg.enable_judge,
         "enable_strategy_hook": cfg.enable_strategy_hook,
         "forced_strategy": cfg.forced_strategy,
-        "llm_provider": cfg.llm_provider,
-        "judge_provider": cfg.judge_provider,
+        "llm_provider": cfg.llm.provider,
+        "judge_provider": cfg.judge.provider,
+        "llm_model": cfg.llm.model,
+        "judge_model": cfg.judge.model if cfg.enable_judge else None,
     })
 
     tcs = load_csv(cfg.tests_path)
 
-    # filters
-    # (kept minimal here; can be expanded)
-    # We’ll keep filtering in cli later if desired.
-
-    llm = make_provider(cfg.llm_provider)
-    judge = make_provider(cfg.judge_provider) if cfg.enable_judge else None
+    llm = make_provider(cfg.llm)
+    judge = make_provider(cfg.judge) if cfg.enable_judge else None
 
     if cfg.run_mode == "testcase":
         for tc in tcs:
@@ -61,17 +58,17 @@ def run_pipeline(cfg: ResolvedConfig):
 def _run_one(tc: TestCase, llm, judge, cfg, logger: RunLogger):
     t0 = time.perf_counter()
     try:
-        # DummyProvider reads model from req but we don’t load from env yet.
-        model = os.getenv("LLM_MODEL", "dummy-model")
+        model = cfg.llm.model
+        temp = cfg.llm.temperature
         ans = llm.generate(
-            req=__mk_req(tc, model=model)
+            req=__mk_req(tc, model=model, temperature=temp)
         ).text
         rt = round(time.perf_counter() - t0, 3)
 
         judge_block = None
         overall = None
         if judge:
-            raw = judge.judge(prompt=f"Judge: {tc.testcase_id}", model=os.getenv("JUDGE_MODEL", model))
+            raw = judge.judge(prompt=f"Judge: {tc.testcase_id}", model=cfg.judge.model, temperature=cfg.judge.temperature,)
             arr = parse_judge_array(raw)
             judge_block = pick_block_for_test(tc.testcase_id, arr) or None
             if judge_block and isinstance(judge_block.get("scores"), dict):
@@ -106,12 +103,12 @@ def _run_incident_group(incident_id: str, group: list[TestCase], llm, judge, cfg
     for tc in group:
         _run_one(tc, llm, judge, cfg, logger)
 
-def __mk_req(tc: TestCase, model: str):
+def __mk_req(tc: TestCase, model: str, temperature: float):
     from llm_suite.providers.base import LLMRequest
     return LLMRequest(
         model=model,
         prompt=tc.user_message,
         context=tc.context_json,
-        temperature=float(os.getenv("LLM_TEMPERATURE","0.2")),
+        temperature=temperature,
         input_type="text",
     )
