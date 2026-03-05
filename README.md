@@ -54,59 +54,91 @@ python scripts/run_suite.py --tests data/examples/testcases_minimal.csv
 
 ---
 
-## .env Konfiguration (Konzept)
+## .env Konfiguration
 
-### Default LLM Provider
-Die Suite wird über folgende, möglichst generische Variablen konfiguriert:
-- `LLM_PROVIDER` - Provider-Name (z.B. `provider_506`, später `azure_openai`)
-- `LLM_BASE` - Basis-URL des Dienstleisters
-- `LLM_API_KEY` - Token/Key
-- `LLM-MODEL` - Modellname / Modell-Auswahl
+### Generisches Provider-Schema (LLM)
+Die Suite wird primär über diese generischen Variablen konfiguriert:
+
+- `LLM_PROVIDER` – Provider-Name (z.B. `provider_506`, später `azure_openai`)
+- `LLM_BASE_URL` – Basis-URL des Dienstleisters (z.B. `https://companygpt.506.ai:3003`)
+- `LLM_API_KEY` – Token/Key (bei 506 optional, falls `COMPANYGPT_API_KEY` gesetzt ist)
+- `LLM_MODEL` – Modellname / Modell-ID
 - `LLM_TIMEOUT_S`, `LLM_TEMPERATURE`
-- Optional:
-  - `LLM_EXTRA_HEADERS_JSON`
-  - `LLM_EXTRA_BODY_JSON`
+
+Optional:
+- `LLM_EXTRA_HEADERS_JSON` – zusätzliche Header als JSON (string)
+- `LLM_EXTRA_BODY_JSON` – zusätzliche Body-Felder als JSON (string)
 
 ### Judge Provider (optional)
 Der Judge ist konzeptionell ein zweiter Provider (kann identisch oder getrennt sein):
+
 - `JUDGE_ENABLE=true|false`
-- `JUDGE_PROVIDER`, `JUDGE_BASE_URL`, `JUDGE_API_KEY`, `JUDGE_MODEL`, `JUDGE_TIMEOUT_S`
+- `JUDGE_PROVIDER`, `JUDGE_BASE_URL`, `JUDGE_API_KEY`, `JUDGE_MODEL`, `JUDGE_TIMEOUT_S`, `JUDGE_TEMPERATURE`
+
+**Hinweis (Fallbacks für 506.ai / CompanyGPT):**
+Falls `LLM_BASE_URL` / `LLM_API_KEY` nicht gesetzt sind, werden (für `provider_506`) automatisch folgende Variablen als Fallback verwendet:
+- `COMPANYGPT_BASE_URL`
+- `COMPANYGPT_API_KEY`
+Zusätzlich benötigt `provider_506`:
+- `COMPANYGPT_ORG_ID`
+- optional: `COMPANYGPT_GENERATOR_ASSISTANT_ID`, `COMPANYGPT_JUDGE_ASSISTANT_ID`
 
 ---
 
-## CLI (geplant)
-Beispiele:  
+## CLI
+
 ```bash
-# Default: Strategy Hook OFF
-python scripts/run_suite.py --tests data/examples/testcases_minimal.csv
+# Default: incident mode + Judge (wenn JUDGE_ENABLE=true)
+python scripts/run_suite.py --tests data/examples/lamp_sample.csv
 
-# Strategy Hook ON
-python scripts/run_suite.py --tests data/examples/testcases_minimal.csv --enable-strategy-hook
+# ohne Judge
+python scripts/run_suite.py --tests data/examples/lamp_sample.csv --no-judge
 
-# Strategy Hook ON + erzwinge Strategy
-python scripts/run_suite.py --tests data/examples/testcases_minimal.csv --enable-strategy-hook --strategy S2
+# Robustheit im Unternehmensnetz (Retries)
+python scripts/run_suite.py --tests data/examples/lamp_sample.csv --max-retries 3
+
+# Fail-fast, wenn DNS/Netz dauerhaft weg ist
+python scripts/run_suite.py --tests data/examples/lamp_sample.csv --max-retries 2 --fail-fast --fail-fast-threshold 5
+
+# Strategy Hook ON (aktuell nur Vorbereitung)
+python scripts/run_suite.py --tests data/examples/lamp_sample.csv --enable-strategy-hook
+python scripts/run_suite.py --tests data/examples/lamp_sample.csv --enable-strategy-hook --strategy S2
 ```
 
 ---
 
-## Testdatenformat (Start: CSV)
-Zum Start wird CSV unterstützt (später optional JSON).  
-  
-Minimalbeispiel: `data/examples/testcases_minimal.csv`
+## Testdatenformat (CSV)
+
+Start: CSV (später optional JSON).
+
+Pflichtspalten:
+- `testcase_id`
+- `user_message`
+- `context_json` (JSON als String; kann `{}` sein)
+
+Empfohlen (für Incident-Mode / Auswertung):
+- `incident_id`
+- `context_level` (z.B. `L0_minimal`, `L2_full`)
+- `strategy` (z.B. `S0`, `S1`, `S2`)
+
+Beispiel:
 ```csv
-id,question,expected_keywords
-t001,"Wie resette ich eine Straßenlampe nach einem Ausfall?","reset;controller;power-cycle"
-t002,"Ich habe Spotty Connectivity. Was soll ich dokumentieren?","offline;sync;notes"
+testcase_id,incident_id,context_level,strategy,user_message,context_json
+INC-LAMP-0001-TC1,INC-LAMP-0001,L0_minimal,S0,"Lampe war vorhin aus, ist jetzt wieder an. (Asset-ID: n571...)","{""asset_osm"":""n571...""}"
+INC-LAMP-0001-TC2,INC-LAMP-0001,L2_full,S1,"Lampe war vorhin aus, ist jetzt wieder an.","{""asset"":{...}, ""incident"":{...}}"
 ```
 
 ---
 
-## Output / Runs (geplant)
-Jeder Run schreibt in `runs/<run_id>/`:  
-- `manifest.json` - Snapshot der Run-Konfiguration (env+cli resolved, Versionen, etc.)
-- `results.jsonl` - eine Zeile pro Testfall (Provider, Prompt-Hash, Response, Judge-Score, Runtime)
-- `errors.jsonl` - optionale Fehler pro Testfall
-- `aggregate.json` - Aggregation nach Run-Ende (Means, Counts, etc.)
+## Output / Runs
+
+Jeder Run schreibt nach `runs/<run_id>/`:
+
+- `manifest.json` – Snapshot der Run-Konfiguration (env + CLI resolved)
+- `results.jsonl` – eine Zeile pro Testfall (Antwort, Runtime, optional Judge-Block)
+- `errors.jsonl` – Fehlerfälle inkl. Diagnosefeldern (z.B. `phase`, `provider`, `host`, `is_dns_error`, `retries`, `status_code`)
+- `aggregate.json` – Aggregation nach Run-Ende (Counts/Means; wird schrittweise erweitert)
+
 `runs/` ist in `.gitignore` und wird nicht eingecheckt.
 
 ---

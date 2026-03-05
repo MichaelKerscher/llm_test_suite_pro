@@ -19,6 +19,11 @@ from llm_suite.judge.judge_runner import (
     pick_block_for_test,
 )
 
+try:
+    from llm_suite.providers.provider_506 import ProviderCallError
+except Exception:
+    ProviderCallError = None
+
 
 def _group_by_incident(tcs: list[TestCase]) -> dict[str, list[TestCase]]:
     g: dict[str, list[TestCase]] = defaultdict(list)
@@ -42,12 +47,55 @@ def _mean_overall_from_judge_block(jb: dict | None) -> float | None:
     return (sum(vals) / len(vals)) if vals else None
 
 
+def _mk_error_payload(
+    *,
+    testcase_id: str,
+    incident_id: str,
+    phase: str,
+    provider: str,
+    host: str | None,
+    exc: Exception,
+    runtime_s: float,
+):
+    is_dns_error = False
+    is_network_error = False
+    retries = 0
+    status_code = None
+    response_text = None
+    exception_type = type(exc).__name__
+    msg = str(exc)
+
+    if ProviderCallError is not None and isinstance(exc, ProviderCallError):
+        is_dns_error = bool(getattr(exc, "is_dns_error", False))
+        is_network_error = bool(getattr(exc, "is_network_error", False))
+        retries = int(getattr(exc, "retries", 0) or 0)
+        status_code = getattr(exc, "status_code", None)
+        response_text = getattr(exc, "response_text", None)
+        exception_type = getattr(exc, "exception_type", exception_type)
+        msg = str(exc)
+
+    return {
+        "testcase_id": testcase_id,
+        "incident_id": incident_id,
+        "phase": phase,
+        "provider": provider,
+        "host": host,
+        "exception_type": exception_type,
+        "error": msg,
+        "is_dns_error": is_dns_error,
+        "is_network_error": is_network_error,
+        "retries": retries,
+        "status_code": status_code,
+        "response_text": response_text,
+        "runtime_s": runtime_s,
+    }
+
+
 def run_pipeline(cfg: ResolvedConfig):
     run_id = make_run_id(cfg)
     run_dir = os.path.join(cfg.runs_dir, run_id)
     logger = RunLogger(run_dir)
 
-    # manifest snapshot
     logger.write_manifest(
         {
             "run_id": run_id,
@@ -60,35 +108,58 @@ def run_pipeline(cfg: ResolvedConfig):
             "judge_provider": cfg.judge.provider,
             "llm_model": cfg.llm.model,
             "judge_model": cfg.judge.model if cfg.enable_judge else None,
+            "max_retries": cfg.max_retries,
+            "fail_fast": cfg.fail_fast,
+            "fail_fast_threshold": cfg.fail_fast_threshold,
         }
     )
 
-    # load testcases
     tcs = load_csv(cfg.tests_path)
-
-    # providers
     llm = make_provider(cfg.llm)
     judge = make_provider(cfg.judge) if cfg.enable_judge else None
 
-    # execution
     if cfg.run_mode == "testcase":
+        consecutive_net_errors = 0
         for tc in tcs:
-            _run_one(tc, llm, judge, cfg, logger)
+            ok, was_net = _run_one(tc, llm, judge, cfg, logger)
+            if not ok and was_net:
+                consecutive_net_errors += 1
+            elif ok:
+                consecutive_net_errors = 0
+
+            if cfg.fail_fast and consecutive_net_errors >= cfg.fail_fast_threshold:
+                raise SystemExit(
+                    f"[FAIL-FAST] Aborting after {consecutive_net_errors} consecutive network errors."
+                )
+
         write_aggregate(run_dir)
         return
 
-    # incident mode
     groups = _group_by_incident(tcs)
+
+    consecutive_net_errors = 0
     for incident_id in sorted(groups.keys()):
         group = _stable_sort(groups[incident_id])
-        _run_incident_group(incident_id, group, llm, judge, cfg, logger)
+
+        ok, net_errors_in_incident = _run_incident_group(incident_id, group, llm, judge, cfg, logger)
+
+        # if whole incident had network errors, count them as consecutive signal
+        if net_errors_in_incident > 0 and not ok:
+            consecutive_net_errors += net_errors_in_incident
+        else:
+            consecutive_net_errors = 0
+
+        if cfg.fail_fast and consecutive_net_errors >= cfg.fail_fast_threshold:
+            raise SystemExit(
+                f"[FAIL-FAST] Aborting after {consecutive_net_errors} consecutive network errors."
+            )
 
     write_aggregate(run_dir)
 
 
-def _run_one(tc: TestCase, llm, judge, cfg: ResolvedConfig, logger: RunLogger):
+def _run_one(tc: TestCase, llm, judge, cfg: ResolvedConfig, logger: RunLogger) -> tuple[bool, bool]:
     """
-    testcase-mode: generate + single-mode judge
+    Returns (ok, was_network_error)
     """
     t0 = time.perf_counter()
     try:
@@ -102,7 +173,7 @@ def _run_one(tc: TestCase, llm, judge, cfg: ResolvedConfig, logger: RunLogger):
                 user_message=tc.user_message,
                 context_json=tc.context_json,
                 assistant_answer=ans,
-                expected_elements="",  # TODO: later from CSV/rules
+                expected_elements="",
                 asset_type="streetlight",
                 fault_type="unknown",
             )
@@ -125,16 +196,22 @@ def _run_one(tc: TestCase, llm, judge, cfg: ResolvedConfig, logger: RunLogger):
                 "overall_score": overall,
             }
         )
+        return True, False
+
     except Exception as e:
         rt = round(time.perf_counter() - t0, 3)
-        logger.log_error(
-            {
-                "testcase_id": tc.testcase_id,
-                "incident_id": tc.incident_id,
-                "error": str(e),
-                "runtime_s": rt,
-            }
+
+        payload = _mk_error_payload(
+            testcase_id=tc.testcase_id,
+            incident_id=tc.incident_id,
+            phase=getattr(e, "phase", "generate_or_judge"),
+            provider=getattr(e, "provider", cfg.llm.provider),
+            host=getattr(e, "host", None),
+            exc=e,
+            runtime_s=rt,
         )
+        logger.log_error(payload)
+        return False, bool(payload.get("is_network_error", False))
 
 
 def _run_incident_group(
@@ -144,14 +221,12 @@ def _run_incident_group(
     judge,
     cfg: ResolvedConfig,
     logger: RunLogger,
-):
+) -> tuple[bool, int]:
     """
-    incident-mode:
-      - generate answers for all testcases in the incident
-      - judge once with INCIDENT-MODE prompt (JSON array)
-      - attach each judge block back to each testcase result
+    Returns (ok, network_error_count_in_incident)
     """
     generated: list[dict] = []
+    net_errs = 0
 
     # 1) generate all answers
     for tc in group:
@@ -174,36 +249,57 @@ def _run_incident_group(
             )
         except Exception as e:
             rt = round(time.perf_counter() - t0, 3)
-            logger.log_error(
-                {
-                    "testcase_id": tc.testcase_id,
-                    "incident_id": tc.incident_id,
-                    "error": str(e),
-                    "runtime_s": rt,
-                }
+            payload = _mk_error_payload(
+                testcase_id=tc.testcase_id,
+                incident_id=tc.incident_id,
+                phase=getattr(e, "phase", "generate"),
+                provider=getattr(e, "provider", cfg.llm.provider),
+                host=getattr(e, "host", None),
+                exc=e,
+                runtime_s=rt,
             )
+            if payload.get("is_network_error"):
+                net_errs += 1
+            logger.log_error(payload)
 
     # 2) judge once per incident
     judge_arr = None
     if judge and generated:
-        jp = build_judge_prompt_incident(
-            incident_id=incident_id,
-            blocks=[
-                {
-                    "test_id": r["test_id"],
-                    "context_level": r["context_level"],
-                    "user_message": r["user_message"],
-                    "context_json": r["context_json"],
-                    "answer": r["answer"],
-                }
-                for r in generated
-            ],
-            expected_elements="",  
-            asset_type="streetlight",
-            fault_type="unknown",
-        )
-        raw = judge.judge(prompt=jp, model=cfg.judge.model, temperature=cfg.judge.temperature)
-        judge_arr = parse_judge_array(raw)
+        t0 = time.perf_counter()
+        try:
+            jp = build_judge_prompt_incident(
+                incident_id=incident_id,
+                blocks=[
+                    {
+                        "test_id": r["test_id"],
+                        "context_level": r["context_level"],
+                        "user_message": r["user_message"],
+                        "context_json": r["context_json"],
+                        "answer": r["answer"],
+                    }
+                    for r in generated
+                ],
+                expected_elements="",
+                asset_type="streetlight",
+                fault_type="unknown",
+            )
+            raw = judge.judge(prompt=jp, model=cfg.judge.model, temperature=cfg.judge.temperature)
+            judge_arr = parse_judge_array(raw)
+        except Exception as e:
+            rt = round(time.perf_counter() - t0, 3)
+            payload = _mk_error_payload(
+                testcase_id="__INCIDENT_JUDGE__",
+                incident_id=incident_id,
+                phase=getattr(e, "phase", "judge"),
+                provider=getattr(e, "provider", cfg.judge.provider),
+                host=getattr(e, "host", None),
+                exc=e,
+                runtime_s=rt,
+            )
+            if payload.get("is_network_error"):
+                net_errs += 1
+            logger.log_error(payload)
+            judge_arr = None
 
     # 3) attach judge blocks and log per testcase
     for r in generated:
@@ -224,6 +320,9 @@ def _run_incident_group(
                 "overall_score": overall,
             }
         )
+
+    ok = (net_errs == 0)
+    return ok, net_errs
 
 
 def __mk_req(tc: TestCase, model: str, temperature: float):

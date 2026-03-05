@@ -17,13 +17,19 @@ class ProviderCfg:
     extra_body_json: str
     endpoint_path: str
 
-    # 506-specific (optional, used by provider_506)
+    # 506-specific
     org_id: str
     data_collection_id: str
     generator_assistant_id: str
     judge_assistant_id: str
     internal_system_prompt: bool
     default_mode: str
+
+    # retry knobs (used by providers)
+    max_retries: int
+    retry_backoff_base_s: float
+    retry_backoff_max_s: float
+    retry_jitter_s: float
 
 
 @dataclass
@@ -40,10 +46,12 @@ class ResolvedConfig:
     llm: ProviderCfg
     judge: ProviderCfg
 
+    # pipeline knobs
+    max_retries: int
+    fail_fast: bool
+    fail_fast_threshold: int
 
-# -------------------------
-# small env helpers
-# -------------------------
+
 def _env_str(key: str, default: str = "") -> str:
     v = os.getenv(key)
     return default if v is None else str(v).strip()
@@ -76,29 +84,17 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
-# -------------------------
-# Provider config builder
-# -------------------------
-def _provider_cfg(prefix: str) -> ProviderCfg:
-    """
-    Build provider config from generic PREFIX_* keys,
-    with robust fallbacks for CompanyGPT/506.ai env naming.
-    """
-
-    # Provider name
+def _provider_cfg(prefix: str, *, max_retries: int) -> ProviderCfg:
     provider = _env_str(f"{prefix}_PROVIDER", "dummy")
 
-    # Model: prefer PREFIX_MODEL, fallback to TESTSUITE_DEFAULT_MODEL (legacy)
     model = _env_str(f"{prefix}_MODEL", "")
     if not model:
         model = _env_str("TESTSUITE_DEFAULT_MODEL", "dummy-model")
 
-    # Base URL: prefer PREFIX_BASE_URL, fallback to COMPANYGPT_BASE_URL
     base_url = _env_str(f"{prefix}_BASE_URL", "")
     if not base_url:
         base_url = _env_str("COMPANYGPT_BASE_URL", "")
 
-    # API Key: prefer PREFIX_API_KEY, fallback to COMPANYGPT_API_KEY
     api_key = _env_str(f"{prefix}_API_KEY", "")
     if not api_key:
         api_key = _env_str("COMPANYGPT_API_KEY", "")
@@ -110,13 +106,17 @@ def _provider_cfg(prefix: str) -> ProviderCfg:
     extra_body_json = _env_str(f"{prefix}_EXTRA_BODY_JSON", "{}")
     endpoint_path = _env_str(f"{prefix}_ENDPOINT_PATH", "")
 
-    # 506 keys (kept provider-agnostic but available)
     org_id = _env_str("COMPANYGPT_ORG_ID", "")
     data_collection_id = _env_str("COMPANYGPT_DATA_COLLECTION_ID", "")
     generator_assistant_id = _env_str("COMPANYGPT_GENERATOR_ASSISTANT_ID", "")
     judge_assistant_id = _env_str("COMPANYGPT_JUDGE_ASSISTANT_ID", "")
     internal_system_prompt = _env_bool("COMPANYGPT_INTERNAL_SYSTEM_PROMPT", True)
     default_mode = _env_str("COMPANYGPT_DEFAULT_MODE", "BASIC")
+
+    # retry knobs (env override possible)
+    backoff_base_s = _env_float("RETRY_BACKOFF_BASE_S", 1.0)
+    backoff_max_s = _env_float("RETRY_BACKOFF_MAX_S", 8.0)
+    jitter_s = _env_float("RETRY_JITTER_S", 0.25)
 
     return ProviderCfg(
         provider=provider,
@@ -134,6 +134,10 @@ def _provider_cfg(prefix: str) -> ProviderCfg:
         judge_assistant_id=judge_assistant_id,
         internal_system_prompt=internal_system_prompt,
         default_mode=default_mode,
+        max_retries=max_retries,
+        retry_backoff_base_s=backoff_base_s,
+        retry_backoff_max_s=backoff_max_s,
+        retry_jitter_s=jitter_s,
     )
 
 
@@ -149,12 +153,18 @@ def load_config(args) -> ResolvedConfig:
     runs_dir = _env_str("RUNS_DIR", "runs")
     run_name = _env_str("RUN_NAME", "local-dev")
 
-    llm = _provider_cfg("LLM")
+    # pipeline knobs (CLI overrides env)
+    max_retries = int(args.max_retries) if getattr(args, "max_retries", None) is not None else _env_int("MAX_RETRIES", 3)
+    fail_fast = bool(args.fail_fast) if getattr(args, "fail_fast", None) is not None else _env_bool("FAIL_FAST", False)
+    fail_fast_threshold = (
+        int(args.fail_fast_threshold)
+        if getattr(args, "fail_fast_threshold", None) is not None
+        else _env_int("FAIL_FAST_THRESHOLD", 5)
+    )
 
-    # Build judge cfg but inherit LLM values if judge-specific vars are absent/blank
-    judge = _provider_cfg("JUDGE")
+    llm = _provider_cfg("LLM", max_retries=max_retries)
 
-    # Inherit *only if not explicitly set*
+    judge = _provider_cfg("JUDGE", max_retries=max_retries)
     if not _env_str("JUDGE_PROVIDER", ""):
         judge.provider = llm.provider
     if not _env_str("JUDGE_MODEL", ""):
@@ -176,12 +186,14 @@ def load_config(args) -> ResolvedConfig:
         run_name=run_name,
         llm=llm,
         judge=judge,
+        max_retries=max_retries,
+        fail_fast=fail_fast,
+        fail_fast_threshold=fail_fast_threshold,
     )
 
 
 def make_run_id(cfg: ResolvedConfig) -> str:
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    # keep it filesystem-friendly
     provider = (cfg.llm.provider or "unknown").replace("/", "_").replace(" ", "_")
     run_name = (cfg.run_name or "run").replace("/", "_").replace(" ", "_")
     return f"{ts}__{run_name}__{provider}"
