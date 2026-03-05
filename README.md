@@ -8,7 +8,7 @@ Ziel ist eine **Provider-agnostische** Testpipeline, die sich per **`.env`** auf
 - **Austauschbare Provider** (Beispiel zuerst: `506.ai`, später: `Azure OpenAI`, optional: self-hosted/OpenAI-kompatibel)
 - **Reproduzierbarkeit**: Run-ID, Manifest, JSONL-Logging
 - **Standard-Pipeline** (Default):
-  **Loader → LLM-Call → Judge → Logging → Aggregation (nach Run-Ende)**
+  **Loader -> LLM-Call -> Judge -> Logging -> Aggregation (nach Run-Ende)**
 - **Strategy Hook optional** via CLI (Default: aus)
 
 ---
