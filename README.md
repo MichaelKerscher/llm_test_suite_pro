@@ -15,11 +15,13 @@ Ziel ist eine **Provider-agnostische** Testpipeline, die sich per **`.env`** auf
 
 ## Projektstatus
 Dieses Repository wird **schrittweise** aufgebaut:
-1) Repo/README/Grundstruktur ✅  
-2) Minimaler “smoke test” ohne echten Provider (Dummy-Provider)  
-3) Provider-Integration: **506.ai** (externer Dienstleister)  
-4) Erweiterung: **Azure OpenAI** (weiterer Dienstleister)  
-5) Optional: OpenAI-kompatible Self-hosted Provider
+1) Repo/README/Grundstruktur   
+2) Robustheit (Retries / Fail-fast)
+3) Aggregation: Snapshot + History
+4) Minimaler “smoke test” ohne echten Provider (Dummy-Provider)  
+5) Provider-Integration: **506.ai** (externer Dienstleister)
+6) Erweiterung: **Azure OpenAI** (weiterer Dienstleister)  
+7) Optional: OpenAI-kompatible Self-hosted Provider
 
 ---
 
@@ -118,7 +120,6 @@ Pflichtspalten:
 
 Empfohlen (für Incident-Mode / Auswertung):
 - `incident_id`
-- `context_level` (z.B. `L0_minimal`, `L2_full`)
 - `strategy` (z.B. `S0`, `S1`, `S2`)
 
 Beispiel:
@@ -137,7 +138,11 @@ Jeder Run schreibt nach `runs/<run_id>/`:
 - `manifest.json` – Snapshot der Run-Konfiguration (env + CLI resolved)
 - `results.jsonl` – eine Zeile pro Testfall (Antwort, Runtime, optional Judge-Block)
 - `errors.jsonl` – Fehlerfälle inkl. Diagnosefeldern (z.B. `phase`, `provider`, `host`, `is_dns_error`, `retries`, `status_code`)
-- `aggregate.json` – Aggregation nach Run-Ende (Counts/Means; wird schrittweise erweitert)
+- `aggregate.json` – Snapshot-Aggregation (Counts + Means nach **Strategy S0/S1/S2** + Deltas pro Incident)
+- `report.md` – Kurzreport (Snapshot)
+- `history_by_run.json` – Zeitreihe über alle Runs (pro Run: Summary nach Strategy)
+- `history_overall.json` – Zusammenfassung über alle Runs (mean-of-run-means, min/max)
+- `history_report.md` – Kurzreport über die letzten Runs (inkl. Δ vs vorheriger Run)
 
 `runs/` ist in `.gitignore` und wird nicht eingecheckt.
 
